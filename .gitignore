@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# 실험 결과 (로그/비디오 제외, results.md만 포함)
+results/**/*.log
+results/**/*.mp4
+results/**/*.npy
+results_pro/**/*.log
+results_pro/**/*.mp4
+results_pro/**/*.npy
+
+# temporal-arch 작업물
+token_cache/
+checkpoints/
+runs/
+*.pt
+wandb/
