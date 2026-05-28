@@ -24,109 +24,123 @@ Mamba-JEPA-Flow는 세 가지 핵심 한계를 해결합니다:
 
 ## 아키텍처
 
+### 듀얼 토큰 설계
+
+Qwen-VL은 두 종류의 토큰을 생성합니다:
+- **`action_tokens`** (프레임 사이사이 배치): "이 행동이 시각적으로 어떤 변화를 일으키는가" → JEPA Predictor 전용
+- **`embodied_action_tokens`** (프롬프트 끝 배치): "로봇이 무엇을 해야 하는가" → DiT(Flow-Matching) 전용
+
+프롬프트 내 위치와 학습 신호(loss)가 다르기 때문에, Qwen-VL이 각 역할에 최적화된 다른 표현을 자연스럽게 학습합니다.
+
 ```
                         ┌─────────────────────────────────────────────┐
-                        │          Phase 0: Qwen-VL (동결)            │
- 언어 명령 + 이미지 ───▶│  "빨간 블록을 집어"  +  카메라 영상          │
-                        │           ↓                                │
-                        │     action_tokens (잠재 행동 의도)          │
-                        └──────────┬──────────────────────────────────┘
-                                   │
-          ┌────────────────────────┼────────────────────────┐
-          ▼                        ▼                        │
-┌──────────────────┐   ┌────────────────────┐              │
-│  Phase 1: V-JEPA │   │  JEPA Predictor    │              │
-│ Encoder (동결)   │   │  (학습 가능)       │              │
-│                  │   │                    │              │
-│ 프레임 → s_{t-1} │   │ s_{t-1} + a_{t-1} │              │
-│           s_t    │   │      → ŝ_t        │              │
-└────────┬─────────┘   └────────┬───────────┘              │
-         │                      │                          │
-         ▼                      ▼ (.detach())              ▼
-┌──────────────────────────────────────────────────────────────────┐
-│              Phase 2: Mamba 시공간 인터리버 (핵심 기여)           │
-│                                                                  │
-│  입력: [ s_{t-1},  a_{t-1},  ŝ_t,  s_t ] (시간순 교차 배열)    │
-│           ↓         ↓         ↓      ↓                          │
-│         [h_1] ──▶ [h_2] ──▶ [h_3] ──▶ [h_4] ──▶ [readout]    │
-│                              ▲                                   │
-│                        예측 오차 인지                             │
-│                       (ŝ_t vs s_t)                              │
-│                                                                  │
-│  출력: 컨텍스트 벡터 c (32개 토큰)                               │
-└──────────────────────────┬───────────────────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────────────────┐
-│          Phase 3: Flow-Matching 액션 디코더                      │
-│                                                                  │
-│  조건: c (무엇을 할지) + p_t (로봇 관절 상태, Late Injection)    │
-│                                                                  │
-│  가우시안 노이즈 ──▶ ODE: dz/dt = v_θ(z,t,c,p_t) ──▶ a_t      │
-│                     (연속적이고 부드러운 행동 궤적)               │
-└──────────────────────────────────────────────────────────────────┘
+                        │          Phase 0: Qwen-VL                   │
+ 언어 명령 + 이미지 ───▶│  "...frames {actions}...actions {e_actions}" │
+                        │       ↓                       ↓            │
+                        │  action_tokens      embodied_action_tokens │
+                        └──────┬────────────────────────┬────────────┘
+                               │                        │
+          ┌────────────────────┤                        │
+          ▼                    ▼                        │
+┌──────────────────┐  ┌────────────────┐               │
+│  Phase 1: V-JEPA │  │ JEPA Predictor │               │
+│ Encoder (동결)   │  │ (학습 가능)    │               │
+│                  │  │                │               │
+│ 프레임 → s_{t-1} │  │ s_{t-1}+a_{t-1}│               │
+│           s_t    │  │     → ŝ_t     │               │
+└────────┬─────────┘  └───────┬────────┘               │
+         │                    │                        │
+         ▼                    ▼ (.detach())             │
+┌────────────────────────────────────────────────┐     │
+│     Phase 2: Mamba 시공간 인터리버              │     │
+│                                                │     │
+│  [ s_{t-1}, a_{t-1}, ŝ_t, s_t ] 시간순 스캔   │     │
+│     ↓        ↓       ↓     ↓                  │     │
+│   [h_1]──▶[h_2]──▶[h_3]──▶[h_4]──▶[readout]  │     │
+│                     ▲                          │     │
+│              예측 오차 인지                      │     │
+│                                                │     │
+│  출력: 컨텍스트 벡터 c (32개 토큰)              │     │
+└──────────────────────┬─────────────────────────┘     │
+                       │                               │
+                       ▼                               ▼
+┌──────────────────────────────────────────────────────────┐
+│          Phase 3: DiT (Flow-Matching 액션 디코더)        │
+│                                                          │
+│  cross-attention 조건:                                   │
+│    concat(c, embodied_action_tokens) + p_t              │
+│                                                          │
+│  가우시안 노이즈 ──▶ ODE: v_θ(z,t,c,emb,p_t) ──▶ a_t  │
+│                     (연속적이고 부드러운 행동 궤적)       │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ### 설계 원칙
 
+- **듀얼 토큰 분리**: `action_tokens`은 세계 모델 전용, `embodied_action_tokens`은 행동 생성 전용. 프롬프트 위치와 학습 loss가 다르므로 Qwen-VL이 목적별 최적 표현을 학습.
 - **Gradient 분리**: `predicted_states.detach()`로 `action_loss`가 세계 모델을 오염시키지 않도록 차단. Predictor는 오직 `wm_loss`로만 학습.
-- **Late Injection**: 로봇 고유 상태(`p_t`)는 Flow-Matching 디코더에서만 주입. Mamba 백본은 하드웨어에 독립적이므로, 디코더만 교체하면 다른 로봇에 이식 가능.
+- **Late Injection**: 로봇 고유 상태(`p_t`)는 DiT 디코더에서만 주입. Mamba 백본은 하드웨어에 독립적이므로, 디코더만 교체하면 다른 로봇에 이식 가능.
 - **언어 정보 중복 제거**: 언어는 Qwen-VL에서 한 번만 처리. Mamba는 순수하게 V-JEPA 잠재 공간에서만 동작.
 
 ---
 
 ## 학습
 
-### Co-training 전략 (VLA-JEPA 원본 방식)
+### 2-Stage 학습 파이프라인
 
-매 학습 반복(iteration)마다 두 단계를 번갈아 수행합니다:
+**Stage 1: SSv2 세계 모델 Pretraining**
+```
+SSv2 비디오 데이터 → wm_loss만
+학습 대상: Qwen-VL + VJ Predictor
+동결: V-JEPA Encoder, Mamba, Action Model
+목적: 물리적 동역학 이해의 기초 확립
+```
 
-**Step 1 — 로봇 데이터 (LIBERO)**
-```
-action_loss (Flow-Matching 속도장 예측) + 0.1 * wm_loss (JEPA 상태 예측)
-→ 업데이트 대상: Mamba, Action Model, VJ Predictor
+```bash
+bash scripts/mamba_jepa_flow_stage1.sh
 ```
 
-**Step 2 — 비디오 데이터 (Something-Something V2)**
-```
-wm_loss만 (행동 레이블 없음)
-→ 업데이트 대상: VJ Predictor만 (물리 이해력 보충)
+**Stage 2: LIBERO + SSv2 Co-training**
+
+Stage 1 체크포인트에서 이어서 학습. 매 iteration마다 두 step을 번갈아 수행:
+
+- Step 1 (로봇 데이터 LIBERO): `action_loss + 0.1 * wm_loss`
+- Step 2 (비디오 데이터 SSv2): `wm_loss만` → 세계 모델 물리 이해력 보충
+
+```bash
+bash scripts/mamba_jepa_flow_train.sh
 ```
 
 ### 동결 vs 학습 모듈
 
-| 모듈 | 파라미터 수 | 상태 | 업데이트 기준 |
-|------|-----------|------|-------------|
-| Qwen-VL | ~3B | 동결 | — |
-| V-JEPA Encoder | ~300M | 동결 | — |
-| VJ Predictor | 162M | 학습 | wm_loss |
-| Mamba Backbone | 35M | 학습 | action_loss |
-| Flow-Matching Head | 155M | 학습 | action_loss |
+| 모듈 | 파라미터 수 | Stage 1 | Stage 2 | 업데이트 기준 |
+|------|-----------|---------|---------|-------------|
+| Qwen-VL | ~3B | 학습 | 동결* | wm_loss (S1) |
+| V-JEPA Encoder | ~300M | 동결 | 동결 | — |
+| VJ Predictor | 162M | 학습 | 학습 | wm_loss |
+| Mamba Backbone | 35M | 동결 | 학습 | action_loss |
+| Flow-Matching Head | 155M | 동결 | 학습 | action_loss |
 
-### 학습 실행
-
-```bash
-# 단일 GPU (A6000 48GB)
-bash scripts/mamba_jepa_flow_train.sh
-```
+*Stage 2에서 Qwen-VL 동결은 메모리 제약. GPU 여유 시 해제 권장.
 
 ### 주요 설정
-
-모든 하이퍼파라미터는 `scripts/config/mamba_jepa_flow.yaml`에 정의되어 있습니다.
 
 ```yaml
 framework:
   mamba_backbone:
-    d_model: 1024          # Mamba 내부 차원
-    n_layers: 4            # Mamba 레이어 수
-    num_output_tokens: 32  # Flow-Matching에 전달할 readout 토큰 수
-    output_dim: 2048       # DiT cross_attention_dim과 일치
+    d_model: 1024
+    n_layers: 4
+    num_output_tokens: 32
+    output_dim: 2048
+
+  vj2_model:
+    embodied_action_token: "<|embodied_action|>"
+    num_embodied_action_tokens_per_instruction: 32
 
 trainer:
   learning_rate:
     mamba_backbone: 1.0e-04
     action_model: 1.0e-04
-  freeze_modules: 'vj_encoder,qwen_vl_interface'
 ```
 
 ---
@@ -149,19 +163,21 @@ python examples/LIBERO/eval_libero.py \
 starVLA/
 ├── model/
 │   ├── framework/
-│   │   ├── Mamba_JEPA_Flow.py          # 메인 프레임워크 (Phase 0-3)
+│   │   ├── Mamba_JEPA_Flow.py          # 메인 프레임워크 (듀얼 토큰 + Mamba + DiT)
 │   │   └── VLA_JEPA.py                 # 원본 VLA-JEPA (참조용)
 │   └── modules/
 │       ├── mamba_backbone/
 │       │   └── mamba_temporal_interleaver.py  # Mamba SSM 인터리버
 │       ├── action_model/
-│       │   └── GR00T_ActionHeader.py         # Flow-Matching 디코더
+│       │   └── GR00T_ActionHeader.py         # DiT + Flow-Matching 디코더
 │       └── world_model/
 │           └── vj2_predictor.py              # V-JEPA Predictor
 scripts/
 ├── config/
-│   └── mamba_jepa_flow.yaml            # 학습 설정
-└── mamba_jepa_flow_train.sh            # 실행 스크립트
+│   ├── mamba_jepa_flow_stage1.yaml     # Stage 1 설정 (SSv2 pretraining)
+│   └── mamba_jepa_flow.yaml            # Stage 2 설정 (co-training)
+├── mamba_jepa_flow_stage1.sh           # Stage 1 실행
+└── mamba_jepa_flow_train.sh            # Stage 2 실행
 ```
 
 ---
